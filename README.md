@@ -1,1 +1,3 @@
 # cask
+
+https://riak.com/assets/bitcask-intro.pdf

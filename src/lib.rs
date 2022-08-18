@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::hash::Hash;
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const MAX_FILE_SIZE_BYTES: usize = 2usize.pow(28);
@@ -35,18 +35,21 @@ impl Default for Options {
 }
 
 #[derive(Debug)]
-pub struct Cask<K: Into<Vec<u8>>, V: serde::Serialize + for<'de> serde::Deserialize<'de>> {
+pub struct Cask<
+    K: serde::Serialize + serde::de::DeserializeOwned,
+    V: serde::Serialize + serde::de::DeserializeOwned,
+> {
     current_log_file: BufWriter<File>,
     current_log_file_id: FileId,
-    file_ids: Vec<FileId>,
-    keys: HashMap<K, Entry>,
+    keys: HashMap<K, EntryRef>,
     offset_bytes: u64,
     options: Options,
     _v: PhantomData<V>,
 }
 
+/// Information about where to find an entry in the log files
 #[derive(Debug)]
-struct Entry {
+struct EntryRef {
     /// file containing this entry
     file_id: FileId,
     /// size of the entry on disk, in bytes
@@ -57,59 +60,29 @@ struct Entry {
     timestamp: u128,
 }
 
+// struct Entry {
+//     crc: u32,
+//     timestamp: u128,
+//     key_size: u64,
+//     value_size: u64,
+//     key: Vec<u8>,
+//     value: Vec<u8>,
+// }
+
 type FileId = u128;
 
 impl<K, V> Cask<K, V>
 where
-    K: Clone + Eq + Hash + Into<Vec<u8>>,
-    V: std::fmt::Debug + serde::Serialize + for<'de> serde::Deserialize<'de>,
+    K: std::fmt::Debug + Eq + Hash + serde::Serialize + serde::de::DeserializeOwned,
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
 {
     /// open a bitcask store
     pub fn open(options: Options) -> std::io::Result<Self> {
-        let current_log_file_id = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis();
-
-        let mut current_log_file_path = PathBuf::new();
-        current_log_file_path.push(&options.data_directory);
-        current_log_file_path.push(current_log_file_id.to_string());
-        current_log_file_path.set_extension("log");
-
-        std::fs::create_dir_all(&options.data_directory)?;
-
-        let current_log_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(current_log_file_path)?;
-
-        let current_log_file = BufWriter::new(current_log_file);
-
-        let mut file_ids = vec![];
-
-        for path in std::fs::read_dir(&options.data_directory)? {
-            let path = path?.path();
-            if path.is_file() {
-                if let Some(extension) = path.extension() {
-                    if extension == "log" {
-                        file_ids.push(
-                            path.file_stem()
-                                .unwrap()
-                                .to_str()
-                                .unwrap()
-                                .parse::<u128>()
-                                .unwrap(),
-                        );
-                    }
-                }
-            }
-        }
+        let (current_log_file_id, current_log_file) = create_log_file(&options.data_directory)?;
 
         Ok(Cask {
             current_log_file,
             current_log_file_id,
-            file_ids,
             keys: HashMap::new(),
             offset_bytes: 0,
             options,
@@ -123,7 +96,7 @@ where
     }
 
     fn write_internal(&mut self, key: K, value: ValueOrDeletion<V>) -> std::io::Result<()> {
-        let key_bytes: Vec<u8> = key.clone().into();
+        let key_bytes: Vec<u8> = bincode::serialize(&key).expect("could not serialize key");
         let value_bytes = bincode::serialize(&value).expect("could not serialize value");
 
         let mut crc = crc32fast::Hasher::new();
@@ -164,7 +137,7 @@ where
 
         match value {
             ValueOrDeletion::Value(_) => {
-                let entry = Entry {
+                let entry = EntryRef {
                     file_id: self.current_log_file_id,
                     entry_size,
                     entry_offset: self.offset_bytes,
@@ -186,8 +159,8 @@ where
     }
 
     /// read a key's value
-    pub fn read(&mut self, key: K) -> std::io::Result<Option<V>> {
-        if let Some(entry) = self.keys.get(&key) {
+    pub fn read(&self, key: &K) -> std::io::Result<Option<V>> {
+        if let Some(entry) = self.keys.get(key) {
             let file_id = entry.file_id;
             let mut path = PathBuf::new();
             path.push(&self.options.data_directory);
@@ -228,8 +201,7 @@ where
                 }
             }
 
-            let value: ValueOrDeletion<V> = bincode::deserialize(&value_bytes).unwrap();
-            dbg!(&value);
+            let value: ValueOrDeletion<V> = bincode::deserialize(value_bytes).unwrap();
 
             match value {
                 ValueOrDeletion::Value(value) => Ok(Some(value)),
@@ -240,7 +212,6 @@ where
         }
     }
 
-    /// delete a key by inserting a tombstone value
     pub fn delete(&mut self, key: K) -> std::io::Result<()> {
         self.write_internal(key, ValueOrDeletion::Tombstone)
     }
@@ -251,7 +222,10 @@ where
     }
 
     /// merge logfiles to their most compact representation
-    pub fn merge(&self) -> std::io::Result<()> {
+    /// invariant: user-visible database should be the same after merging as
+    /// it was before merging
+    /// TODO should this return the number of scrubbed records?
+    pub fn merge(&mut self) -> std::io::Result<()> {
         todo!()
     }
 
@@ -261,9 +235,33 @@ where
     }
 }
 
+fn create_log_file<P>(data_directory: P) -> std::io::Result<(u128, BufWriter<File>)>
+where
+    P: AsRef<Path>,
+{
+    let current_log_file_id = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time went backwards")
+        .as_millis();
+
+    let mut current_log_file_path = PathBuf::new();
+    current_log_file_path.push(&data_directory);
+    current_log_file_path.push(current_log_file_id.to_string());
+    current_log_file_path.set_extension("log");
+
+    std::fs::create_dir_all(&data_directory)?;
+
+    let current_log_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(current_log_file_path)?;
+
+    Ok((current_log_file_id, BufWriter::new(current_log_file)))
+}
+
 #[cfg(test)]
 mod tests {
-
     use crate::{Cask, Options};
 
     #[test]
@@ -273,11 +271,11 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db: Cask<&str, usize> = Cask::open(options).unwrap();
+        let mut db = Cask::open(options).unwrap();
 
-        db.write("a", 0).unwrap();
+        db.write("a".to_string(), 0).unwrap();
 
-        let read = db.read("a").unwrap().unwrap();
+        let read = db.read(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 0);
     }
@@ -289,17 +287,17 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db: Cask<&str, usize> = Cask::open(options).unwrap();
+        let mut db = Cask::open(options).unwrap();
 
-        db.write("a", 0).unwrap();
+        db.write("a".to_string(), 0).unwrap();
 
-        let read = db.read("a").unwrap().unwrap();
+        let read = db.read(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 0);
 
-        db.write("a", 1).unwrap();
+        db.write("a".to_string(), 1).unwrap();
 
-        let read = db.read("a").unwrap().unwrap();
+        let read = db.read(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 1);
     }
@@ -311,23 +309,23 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db: Cask<&str, usize> = Cask::open(options).unwrap();
+        let mut db = Cask::open(options).unwrap();
 
-        db.write("a", 0).unwrap();
+        db.write("a".to_string(), 0).unwrap();
 
-        let read = db.read("a").unwrap();
+        let read = db.read(&"a".to_string()).unwrap();
 
         assert_eq!(read, Some(0));
 
-        db.delete("a").unwrap();
+        db.delete("a".to_string()).unwrap();
 
-        let read = db.read("a").unwrap();
+        let read = db.read(&"a".to_string()).unwrap();
 
         assert_eq!(read, None);
 
-        db.write("a", 2).unwrap();
+        db.write("a".to_string(), 2).unwrap();
 
-        let read = db.read("a").unwrap();
+        let read = db.read(&"a".to_string()).unwrap();
 
         assert_eq!(read, Some(2));
     }
@@ -339,9 +337,9 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db: Cask<&str, usize> = Cask::open(options).unwrap();
+        let mut db = Cask::open(options).unwrap();
 
-        db.write("a", 0).unwrap();
+        db.write("a".to_string(), 0).unwrap();
 
         let keys = db.keys().unwrap();
 
@@ -355,15 +353,15 @@ mod tests {
             ..Default::default()
         };
 
-        let mut db: Cask<&str, usize> = Cask::open(options).unwrap();
+        let mut db = Cask::open(options).unwrap();
 
-        db.write("a", 0).unwrap();
+        db.write("a".to_string(), 0).unwrap();
 
         let keys = db.keys().unwrap();
 
         assert_eq!(keys, vec![&"a"]);
 
-        db.delete("a").unwrap();
+        db.delete("a".to_string()).unwrap();
 
         let keys = db.keys().unwrap();
 

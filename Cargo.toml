@@ -9,3 +9,4 @@ edition = "2021"
 crc32fast = "1.3.2"
 bincode = "1.3.3"
 serde = { version = "1", features = ["derive"] }
+thiserror = "1"

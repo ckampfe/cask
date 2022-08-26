@@ -1,4 +1,5 @@
 //! TODO
+//! - merge
 //! - crc verify on initial entries load
 //! - figure out what to do with these "file already exists" timing errors
 //! - value compression via https://github.com/rust-lang/flate2-rs or something else?

@@ -1,5 +1,6 @@
 //! TODO
 //! - crc verify on initial entries load
+//! - figure out what to do with these "file already exists" timing errors
 //! - value compression via https://github.com/rust-lang/flate2-rs or something else?
 
 use serde::de::DeserializeOwned;
@@ -747,6 +748,8 @@ mod tests {
         // the `max_file_len_target_bytes` causes
         // the db to create a new file *only on the subsequent write*
         assert_eq!(initial_log_file_id, current_log_file_id);
+
+        sleep(std::time::Duration::from_millis(5));
 
         // this should force the new log file creation
         db.insert("something else".to_string(), "here".to_string())

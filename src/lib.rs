@@ -1,3 +1,7 @@
+//! TODO
+//! - crc verify on initial entries load
+//! - value compression via https://github.com/rust-lang/flate2-rs or something else?
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,19 +11,32 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::marker::PhantomData;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 use thiserror::Error;
 
-const MAX_FILE_SIZE_BYTES: usize = 2usize.pow(28);
-const HEADER_LENGTH: usize = 36;
+/// 256 MiB
+const DEFAULT_MAX_FILE_LEN_TARGET_BYTES: usize = 2usize.pow(28);
 
+const HEADER_LENGTH: usize = std::mem::size_of::<Crc>()
+    + std::mem::size_of::<TimestampMillis>()
+    + std::mem::size_of::<KeyLen>()
+    + std::mem::size_of::<ValueLen>();
+
+/// u32
 const CRC_BYTES_RANGE: Range<usize> = 0..4;
+/// u128 millis since epoch
 const TIMESTAMP_BYTES_RANGE: Range<usize> = 4..20;
+/// u64
 const KEY_LEN_BYTES_RANGE: Range<usize> = 20..28;
+/// u64
 const VALUE_LEN_BYTES_RANGE: Range<usize> = 28..HEADER_LENGTH;
 
-type Entries<K> = HashMap<K, EntryRef>;
-type FileId = u128;
+type EntryRefs<K> = HashMap<K, EntryRef>;
+type LogFileId = u128;
+type Crc = u32;
+type TimestampMillis = u128;
+type KeyLen = u64;
+type ValueLen = u64;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -29,33 +46,74 @@ pub enum Error {
     Serde(#[from] bincode::Error),
     #[error("io")]
     Io(#[from] std::io::Error),
+    #[error(
+        "CRC32 for data at offset `{entry_offset}` in file `{file_id}` did not match expected"
+    )]
+    Corrupt {
+        file_id: LogFileId,
+        entry_offset: u64,
+    },
 }
 
+/// Distinguishes between a value and deletion on disk
 #[derive(Serialize, Deserialize)]
 enum ValueOrDeletion<V> {
+    /// A actual value of type `V`
     Value(V),
+    /// A tombstone, meaning that that the associated key has been deleted
+    /// and no longer has a value
     Tombstone,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Options {
+    /// Where log files will live.
+    /// Defaults to the current directory.
     pub data_directory: String,
-    pub sync_every_write: bool,
+    /// How to sync/persist writes to disk.
+    /// Defaults to `SyncStrategy::EveryWrite`.
+    pub sync_strategy: SyncStrategy,
+    /// Whether or not to sync writes to disk when `Cask` is dropped.
+    /// Defaults to true.
     pub sync_on_drop: bool,
+    /// Whether to verify the CRC32 of an entry when it is read,
+    /// in order to detect data corruption.
+    /// Defaults to true.
     pub verify_crc_on_read: bool,
-    pub max_file_size_bytes: usize,
+    /// The target maximum file size for log files, in bytes.
+    /// A new log file will be created and swapped in when the current log file exceeds this size.
+    pub max_file_len_target_bytes: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             data_directory: ".".to_string(),
-            sync_every_write: true,
+            sync_strategy: SyncStrategy::default(),
             sync_on_drop: true,
             verify_crc_on_read: true,
-            max_file_size_bytes: MAX_FILE_SIZE_BYTES,
+            max_file_len_target_bytes: DEFAULT_MAX_FILE_LEN_TARGET_BYTES,
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub enum SyncStrategy {
+    /// Data is synced to disk after every write.
+    /// This is the default, as it is the safest,
+    /// but it is also very expensive.
+    /// It has higher system call overhead compared to
+    /// buffering and flushing multiple writes together.
+    #[default]
+    EveryWrite,
+    /// During sustained writes, data is synced to disk at most every `Duration`.
+    /// *Note that this only happens if `write` is called!*
+    /// There is no internal timer, so data can remain unsynced
+    /// if there is no `write` in a given interval!
+    Interval(Duration),
+    /// Syncing only happens when the internal `BufWriter` is filled,
+    /// or when `self.sync()` is explicitly called
+    Manual,
 }
 
 #[derive(Debug)]
@@ -63,53 +121,37 @@ pub struct Cask<
     K: serde::Serialize + serde::de::DeserializeOwned,
     V: serde::Serialize + serde::de::DeserializeOwned,
 > {
+    /// Log file we are currently writing to
     current_log_file: BufWriter<File>,
-    current_log_file_id: FileId,
-    entries: Entries<K>,
+    /// Id of the log file we are currently writing to
+    current_log_file_id: LogFileId,
+    /// Size of the current log file, in bytes
+    current_log_file_size_bytes: usize,
+    /// Map of Key -> EntryRef, so we can retrieve values for a given key
+    entry_refs: EntryRefs<K>,
+    /// Current byte offset into the current log file
     offset_bytes: u64,
+    /// Options for configuration
     options: Options,
+    /// When writes were last synced to the current log file
+    last_sync: std::time::Instant,
+    /// Zero-sized placeholder for V, because V only matters for
+    /// insertion and retrieval and is not present on this type itself
     _v: PhantomData<V>,
 }
 
 /// Information about where to find an entry in the log files
 #[derive(Debug)]
 struct EntryRef {
-    /// file containing this entry
-    file_id: FileId,
-    /// size of the entry on disk, in bytes
+    /// File containing this entry
+    file_id: LogFileId,
+    /// Size of the entry on disk, in bytes
     entry_len: u64,
-    /// the offset in the file where this entry is located, in bytes
+    /// Offset in the file where this entry is located, in bytes
     entry_offset: u64,
-    /// millis since epoch
-    timestamp: u128,
+    /// Millis since epoch
+    timestamp: TimestampMillis,
 }
-
-// struct Entry<K, V> {
-//     crc: u32,
-//     timestamp: u128,
-//     key_size: u64,
-//     value_size: u64,
-//     key: K,
-//     value: V,
-// }
-
-// impl<K, V> Entry<K, V>
-// where
-//     K: serde::de::DeserializeOwned,
-//     V: serde::de::DeserializeOwned,
-// {
-//     fn key(&self) -> K {
-//         self.key
-//     }
-
-//     fn value(&self) -> V {
-//         self.value
-//     }
-
-//     fn len(&self) -> usize {
-//         HEADER_LENGTH + self.key_size as usize + self.value_size as usize
-//     }
-// }
 
 impl<K, V> Cask<K, V>
 where
@@ -120,28 +162,30 @@ where
     pub fn open(options: Options) -> Result<Self> {
         std::fs::create_dir_all(&options.data_directory)?;
 
-        let keys: HashMap<K, EntryRef> = load_entries(&options.data_directory)?;
+        let entry_refs: HashMap<K, EntryRef> = load_entries(&options.data_directory)?;
 
         let (current_log_file_id, current_log_file) = create_log_file(&options.data_directory)?;
 
         Ok(Cask {
             current_log_file,
             current_log_file_id,
-            entries: keys,
+            current_log_file_size_bytes: 0,
+            entry_refs,
             offset_bytes: 0,
+            last_sync: std::time::Instant::now(),
             options,
             _v: PhantomData,
         })
     }
 
     /// write a value to a key
-    pub fn write(&mut self, key: K, value: V) -> Result<()> {
-        self.write_internal(key, ValueOrDeletion::Value(value))
+    pub fn insert(&mut self, key: K, value: V) -> Result<()> {
+        self.write(key, ValueOrDeletion::Value(value))
     }
 
     /// read a key's value
-    pub fn read(&self, key: &K) -> Result<Option<V>> {
-        if let Some(entry_ref) = self.entries.get(key) {
+    pub fn get(&self, key: &K) -> Result<Option<V>> {
+        if let Some(entry_ref) = self.entry_refs.get(key) {
             //
             // open file
             //
@@ -162,7 +206,7 @@ where
             //
             // get header fields
             //
-            let expected_crc = u32::from_le_bytes(buf[CRC_BYTES_RANGE].try_into().unwrap());
+            let expected_crc = Crc::from_le_bytes(buf[CRC_BYTES_RANGE].try_into().unwrap());
             let timestamp_bytes = &buf[TIMESTAMP_BYTES_RANGE];
             let key_len_bytes = &buf[KEY_LEN_BYTES_RANGE];
             let value_len_bytes = &buf[VALUE_LEN_BYTES_RANGE];
@@ -170,8 +214,8 @@ where
             //
             // get kv
             //
-            let key_len: u64 = u64::from_le_bytes(key_len_bytes.try_into().unwrap());
-            let value_len = u64::from_le_bytes(value_len_bytes.try_into().unwrap());
+            let key_len = KeyLen::from_le_bytes(key_len_bytes.try_into().unwrap());
+            let value_len = ValueLen::from_le_bytes(value_len_bytes.try_into().unwrap());
             let key_bytes = &buf[HEADER_LENGTH..(HEADER_LENGTH + key_len as usize)];
             let value_bytes = &buf[(HEADER_LENGTH + key_len as usize)
                 ..(HEADER_LENGTH + key_len as usize + value_len as usize)];
@@ -191,10 +235,10 @@ where
                 };
 
                 if calculated_crc != expected_crc {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "crc32's do not match; data is invalid",
-                    ))?;
+                    Err(Error::Corrupt {
+                        file_id: entry_ref.file_id,
+                        entry_offset: entry_ref.entry_offset,
+                    })?
                 }
             }
 
@@ -216,12 +260,12 @@ where
     }
 
     pub fn delete(&mut self, key: K) -> Result<()> {
-        self.write_internal(key, ValueOrDeletion::Tombstone)
+        self.write(key, ValueOrDeletion::Tombstone)
     }
 
     /// get all keys
     pub fn keys(&self) -> Result<Vec<&K>> {
-        Ok(self.entries.keys().collect())
+        Ok(self.entry_refs.keys().collect())
     }
 
     /// merge logfiles to their most compact representation
@@ -229,10 +273,13 @@ where
     /// it was before merging
     /// TODO should this return the number of scrubbed records?
     pub fn merge(&mut self) -> Result<()> {
+        self.sync()?;
         todo!()
     }
 
-    fn write_internal(&mut self, key: K, value: ValueOrDeletion<V>) -> Result<()> {
+    fn write(&mut self, key: K, value: ValueOrDeletion<V>) -> Result<()> {
+        self.maybe_rotate_log_file()?;
+
         let key_bytes = bincode::serialize(&key).expect("could not serialize key");
         let value_bytes = bincode::serialize(&value).expect("could not serialize value");
 
@@ -241,8 +288,8 @@ where
             .expect("time went backwards")
             .as_millis();
 
-        let key_len = key_bytes.len() as u64;
-        let value_len = value_bytes.len() as u64;
+        let key_len = key_bytes.len() as KeyLen;
+        let value_len = value_bytes.len() as ValueLen;
 
         let crc = {
             let mut crc = crc32fast::Hasher::new();
@@ -261,16 +308,17 @@ where
         self.current_log_file.write_all(&key_bytes)?;
         self.current_log_file.write_all(&value_bytes)?;
 
-        if self.options.sync_every_write {
-            self.sync()?;
+        match self.options.sync_strategy {
+            SyncStrategy::EveryWrite => self.sync()?,
+            SyncStrategy::Interval(sync_interval) => {
+                if std::time::Instant::now().duration_since(self.last_sync) >= sync_interval {
+                    self.sync()?
+                }
+            }
+            SyncStrategy::Manual => (),
         }
 
-        let entry_len = (crc.to_le_bytes().len()
-            + timestamp.to_le_bytes().len()
-            + key_len.to_le_bytes().len()
-            + value_len.to_le_bytes().len()
-            + key_bytes.len()
-            + value_bytes.len()) as u64;
+        let entry_len = (HEADER_LENGTH + key_bytes.len() + value_bytes.len()) as u64;
 
         match value {
             ValueOrDeletion::Value(_) => {
@@ -281,15 +329,34 @@ where
                     timestamp,
                 };
 
-                self.offset_bytes += entry_len;
-
-                self.entries.insert(key, entry_ref);
+                self.entry_refs.insert(key, entry_ref);
             }
             ValueOrDeletion::Tombstone => {
-                self.offset_bytes += entry_len;
-
-                self.entries.remove(&key);
+                self.entry_refs.remove(&key);
             }
+        }
+
+        self.offset_bytes += entry_len;
+        self.current_log_file_size_bytes += entry_len as usize;
+
+        Ok(())
+    }
+
+    /// create a new log file iff it is currently larger
+    /// than the configured `max_file_len_target_bytes`
+    fn maybe_rotate_log_file(&mut self) -> Result<()> {
+        if self.current_log_file_size_bytes >= self.options.max_file_len_target_bytes {
+            // force a sync to flush any pending writes to the current log file,
+            // as data in the internal write buffer could represent partial writes,
+            // and we do not want to stripe an entry across 2 different log files
+            self.sync()?;
+
+            let (new_log_file_id, new_log_file) = create_log_file(&self.options.data_directory)?;
+
+            self.current_log_file_id = new_log_file_id;
+            self.current_log_file = new_log_file;
+
+            self.current_log_file_size_bytes = 0;
         }
 
         Ok(())
@@ -297,9 +364,13 @@ where
 }
 
 impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Cask<K, V> {
-    /// ensure that all pending insertions and deletes are persisted to disk
+    /// Ensure that all pending insertions and deletes are persisted to disk.
+    /// Calls fsync or its platform-specific equivalent.
     pub fn sync(&mut self) -> Result<()> {
         self.current_log_file.flush()?;
+        // force the underlying File to fsync
+        self.current_log_file.get_ref().sync_all()?;
+        self.last_sync = std::time::Instant::now();
         Ok(())
     }
 }
@@ -310,7 +381,9 @@ where
     V: Serialize + DeserializeOwned,
 {
     fn drop(&mut self) {
-        self.sync().expect("could not flush writes on drop")
+        if self.options.sync_on_drop {
+            self.sync().expect("could not flush writes on drop")
+        }
     }
 }
 
@@ -318,7 +391,7 @@ fn load_entries<K>(data_directory: &str) -> Result<HashMap<K, EntryRef>>
 where
     K: Hash + Eq + serde::de::DeserializeOwned,
 {
-    let mut entries = Entries::new();
+    let mut entry_refs = EntryRefs::new();
 
     for dir_entry in std::fs::read_dir(data_directory)? {
         let dir_entry = dir_entry?;
@@ -333,7 +406,7 @@ where
                 .unwrap()
                 .to_str()
                 .unwrap()
-                .parse::<u128>()
+                .parse::<LogFileId>()
                 .unwrap();
 
             let mut current_log_file_path = PathBuf::new();
@@ -349,23 +422,23 @@ where
                     // insert the entry_ref if its timestamp is later than
                     // the existing timestamp, or insert it
                     // if the key does not exist
-                    if let Some(e) = entries.get_mut(&key) {
+                    if let Some(e) = entry_refs.get_mut(&key) {
                         if entry_ref.timestamp > e.timestamp {
                             *e = entry_ref;
                         }
                     } else {
-                        entries.insert(key, entry_ref);
+                        entry_refs.insert(key, entry_ref);
                     }
                 }
             }
         }
     }
 
-    Ok(entries)
+    Ok(entry_refs)
 }
 
 fn stream_entry_refs<K>(
-    log_file_id: u128,
+    log_file_id: LogFileId,
     log_file_path: &Path,
 ) -> std::io::Result<EntryRefOffsetIter<K>> {
     Ok(EntryRefOffsetIter {
@@ -378,9 +451,13 @@ fn stream_entry_refs<K>(
 }
 
 struct EntryRefOffsetIter<K> {
+    /// Offset into the file, in bytes
     offset: u64,
-    log_file_id: u128,
+    /// Id of the log file
+    log_file_id: LogFileId,
+    /// The log file
     log_file: std::fs::File,
+    /// Reusable buffer for loading each entry's header
     header_bytes: [u8; HEADER_LENGTH],
     _k: PhantomData<K>,
 }
@@ -398,8 +475,8 @@ where
             Ok(_) => {
                 let key_len_bytes = &self.header_bytes[KEY_LEN_BYTES_RANGE];
                 let value_len_bytes = &self.header_bytes[VALUE_LEN_BYTES_RANGE];
-                let key_len = u64::from_le_bytes(key_len_bytes.try_into().unwrap());
-                let value_len = u64::from_le_bytes(value_len_bytes.try_into().unwrap());
+                let key_len = KeyLen::from_le_bytes(key_len_bytes.try_into().unwrap());
+                let value_len = ValueLen::from_le_bytes(value_len_bytes.try_into().unwrap());
 
                 let mut key = vec![0; key_len as usize];
 
@@ -421,7 +498,7 @@ where
                         file_id: self.log_file_id,
                         entry_len,
                         entry_offset: self.offset,
-                        timestamp: u128::from_le_bytes(
+                        timestamp: TimestampMillis::from_le_bytes(
                             self.header_bytes[TIMESTAMP_BYTES_RANGE].try_into().unwrap(),
                         ),
                     },
@@ -437,7 +514,7 @@ where
 }
 
 /// note: assumes the data directory already exists!
-fn create_log_file<P>(data_directory: P) -> std::io::Result<(u128, BufWriter<File>)>
+fn create_log_file<P>(data_directory: P) -> std::io::Result<(LogFileId, BufWriter<File>)>
 where
     P: AsRef<Path>,
 {
@@ -462,102 +539,102 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, thread::sleep};
+    use std::{collections::HashSet, path::Path, thread::sleep};
 
     use crate::{Cask, Options};
 
-    struct RmDir(&'static str);
+    struct RmDir<P: AsRef<Path>>(P);
 
-    impl Drop for RmDir {
+    impl<P: AsRef<Path>> Drop for RmDir<P> {
         fn drop(&mut self) {
-            std::fs::remove_dir_all(self.0).unwrap();
+            std::fs::remove_dir_all(&self.0).unwrap();
         }
     }
 
     #[test]
     fn roundtrips_a_value() {
-        let _rm = RmDir("test_data/round_trips_a_value");
-
         let options = Options {
             data_directory: "test_data/round_trips_a_value".to_string(),
             ..Default::default()
         };
 
+        let _rm = RmDir(options.data_directory.clone());
+
         let mut db = Cask::open(options).unwrap();
 
-        db.write("a".to_string(), 0).unwrap();
+        db.insert("a".to_string(), 0).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap().unwrap();
+        let read = db.get(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 0);
     }
 
     #[test]
-    fn writes_overwrite() {
-        let _rm = RmDir("test_data/writes_overwrite");
-
+    fn inserts_overwrite() {
         let options = Options {
-            data_directory: "test_data/writes_overwrite".to_string(),
+            data_directory: "test_data/inserts_overwrite".to_string(),
             ..Default::default()
         };
 
+        let _rm = RmDir(options.data_directory.clone());
+
         let mut db = Cask::open(options).unwrap();
 
-        db.write("a".to_string(), 0).unwrap();
+        db.insert("a".to_string(), 0).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap().unwrap();
+        let read = db.get(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 0);
 
-        db.write("a".to_string(), 1).unwrap();
+        db.insert("a".to_string(), 1).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap().unwrap();
+        let read = db.get(&"a".to_string()).unwrap().unwrap();
 
         assert_eq!(read, 1);
     }
 
     #[test]
     fn delete_deletes() {
-        let _rm = RmDir("test_data/delete_deletes");
-
         let options = Options {
             data_directory: "test_data/delete_deletes".to_string(),
             ..Default::default()
         };
 
+        let _rm = RmDir(options.data_directory.clone());
+
         let mut db = Cask::open(options).unwrap();
 
-        db.write("a".to_string(), 0).unwrap();
+        db.insert("a".to_string(), 0).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap();
+        let read = db.get(&"a".to_string()).unwrap();
 
         assert_eq!(read, Some(0));
 
         db.delete("a".to_string()).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap();
+        let read = db.get(&"a".to_string()).unwrap();
 
         assert_eq!(read, None);
 
-        db.write("a".to_string(), 2).unwrap();
+        db.insert("a".to_string(), 2).unwrap();
 
-        let read = db.read(&"a".to_string()).unwrap();
+        let read = db.get(&"a".to_string()).unwrap();
 
         assert_eq!(read, Some(2));
     }
 
     #[test]
     fn shows_keys() {
-        let _rm = RmDir("test_data/shows_keys");
-
         let options = Options {
             data_directory: "test_data/shows_keys".to_string(),
             ..Default::default()
         };
 
+        let _rm = RmDir(options.data_directory.clone());
+
         let mut db = Cask::open(options).unwrap();
 
-        db.write("a".to_string(), 0).unwrap();
+        db.insert("a".to_string(), 0).unwrap();
 
         let keys = db.keys().unwrap();
 
@@ -566,16 +643,16 @@ mod tests {
 
     #[test]
     fn delete_deletes_keys() {
-        let _rm = RmDir("test_data/delete_deletes_keys");
-
         let options = Options {
             data_directory: "test_data/delete_deletes_keys".to_string(),
             ..Default::default()
         };
 
+        let _rm = RmDir(options.data_directory.clone());
+
         let mut db = Cask::open(options).unwrap();
 
-        db.write("a".to_string(), 0).unwrap();
+        db.insert("a".to_string(), 0).unwrap();
 
         let keys = db.keys().unwrap();
 
@@ -592,17 +669,17 @@ mod tests {
 
     #[test]
     fn loads_entries_on_start() {
-        let _rm = RmDir("test_data/loads_entries_on_start");
+        let options = Options {
+            data_directory: "test_data/loads_entries_on_start".to_string(),
+            ..Default::default()
+        };
+
+        let _rm = RmDir(options.data_directory.clone());
 
         {
-            let options = Options {
-                data_directory: "test_data/loads_entries_on_start".to_string(),
-                ..Default::default()
-            };
+            let mut db1 = Cask::open(options.clone()).unwrap();
 
-            let mut db1 = Cask::open(options).unwrap();
-
-            db1.write("a".to_string(), 99).unwrap();
+            db1.insert("a".to_string(), 99).unwrap();
 
             let keys = db1.keys().unwrap();
 
@@ -612,14 +689,9 @@ mod tests {
         sleep(std::time::Duration::from_millis(5));
 
         {
-            let options = Options {
-                data_directory: "test_data/loads_entries_on_start".to_string(),
-                ..Default::default()
-            };
+            let mut db2 = Cask::open(options.clone()).unwrap();
 
-            let mut db2 = Cask::open(options).unwrap();
-
-            db2.write("b".to_string(), 14).unwrap();
+            db2.insert("b".to_string(), 14).unwrap();
 
             let keys: HashSet<&String> = db2.keys().unwrap().into_iter().collect();
 
@@ -629,12 +701,7 @@ mod tests {
         sleep(std::time::Duration::from_millis(5));
 
         {
-            let options = Options {
-                data_directory: "test_data/loads_entries_on_start".to_string(),
-                ..Default::default()
-            };
-
-            let db3: Cask<String, i32> = Cask::open(options).unwrap();
+            let db3: Cask<String, i32> = Cask::open(options.clone()).unwrap();
 
             let loaded_keys: HashSet<&String> = db3.keys().unwrap().into_iter().collect();
 
@@ -643,13 +710,51 @@ mod tests {
                 HashSet::from([&"a".to_string(), &"b".to_string()])
             );
 
-            let a = db3.read(&"a".to_string()).unwrap();
+            let a = db3.get(&"a".to_string()).unwrap();
 
             assert_eq!(a, Some(99));
 
-            let b = db3.read(&"b".to_string()).unwrap();
+            let b = db3.get(&"b".to_string()).unwrap();
 
             assert_eq!(b, Some(14));
         }
+    }
+
+    #[test]
+    fn rotates_logs() {
+        let options = Options {
+            data_directory: "test_data/rotates_logs".to_string(),
+            max_file_len_target_bytes: 10,
+            ..Default::default()
+        };
+
+        let _rm = RmDir(options.data_directory.clone());
+
+        let mut db: Cask<String, String> = Cask::open(options).unwrap();
+
+        let initial_log_file_id = db.current_log_file_id;
+
+        // 5 bytes + 6 bytes = 11 bytes,
+        // which is greater than 10 bytes
+        db.insert("hello".to_string(), "there!".to_string())
+            .unwrap();
+
+        let current_log_file_id = db.current_log_file_id;
+
+        // the initial log file id is the same as
+        // the log file id after this first write,
+        // as the write that is over
+        // the `max_file_len_target_bytes` causes
+        // the db to create a new file *only on the subsequent write*
+        assert_eq!(initial_log_file_id, current_log_file_id);
+
+        // this should force the new log file creation
+        db.insert("something else".to_string(), "here".to_string())
+            .unwrap();
+
+        let new_log_file_id = db.current_log_file_id;
+
+        assert_ne!(current_log_file_id, new_log_file_id);
+        assert!(new_log_file_id > current_log_file_id);
     }
 }

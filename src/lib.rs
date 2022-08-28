@@ -1,5 +1,6 @@
 //! TODO
 //! - merge
+//! - bincode config nonsense: is this fixed in bincode 2.0?
 //! - crc verify on initial entries load
 //! - figure out what to do with these "file already exists" timing errors
 //! - value compression via https://github.com/rust-lang/flate2-rs or something else?
@@ -118,7 +119,6 @@ pub enum SyncStrategy {
     Manual,
 }
 
-#[derive(Debug)]
 pub struct Cask<
     K: serde::Serialize + serde::de::DeserializeOwned,
     V: serde::Serialize + serde::de::DeserializeOwned,
@@ -135,6 +135,13 @@ pub struct Cask<
     offset_bytes: u64,
     /// Options for configuration
     options: Options,
+    /// bincode configuration because bincode has a weird API
+    /// where the free functions have different configuration
+    /// than the global configuration, for some reason?
+    /// This allows us to serialize enum variants (`ValueOrDeletion`)
+    /// with only a single byte for the tag,
+    /// rather than a 4-byte u32 for the tag.
+    bincode_options: bincode::DefaultOptions,
     /// When writes were last synced to the current log file
     last_sync: std::time::Instant,
     /// Zero-sized placeholder for V, because V only matters for
@@ -176,6 +183,7 @@ where
             offset_bytes: 0,
             last_sync: std::time::Instant::now(),
             options,
+            bincode_options: bincode::DefaultOptions::new(),
             _v: PhantomData,
         })
     }
@@ -247,7 +255,8 @@ where
             //
             // deserialize the value
             //
-            let value: ValueOrDeletion<V> = bincode::deserialize(value_bytes)?;
+            let value: ValueOrDeletion<V> =
+                bincode::Options::deserialize(self.bincode_options, value_bytes)?;
 
             //
             // if it's a value, return it, otherwise None
@@ -282,8 +291,10 @@ where
     fn write(&mut self, key: K, value: ValueOrDeletion<V>) -> Result<()> {
         self.maybe_rotate_log_file()?;
 
-        let key_bytes = bincode::serialize(&key).expect("could not serialize key");
-        let value_bytes = bincode::serialize(&value).expect("could not serialize value");
+        let key_bytes = bincode::Options::serialize(self.bincode_options, &key)
+            .expect("could not serialize key");
+        let value_bytes = bincode::Options::serialize(self.bincode_options, &value)
+            .expect("could not serialize value");
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -448,6 +459,7 @@ fn stream_entry_refs<K>(
         header_bytes: [0u8; HEADER_LENGTH],
         log_file_id,
         log_file: std::fs::File::open(log_file_path)?,
+        bincode_options: bincode::DefaultOptions::new(),
         _k: PhantomData,
     })
 }
@@ -461,6 +473,7 @@ struct EntryRefOffsetIter<K> {
     log_file: std::fs::File,
     /// Reusable buffer for loading each entry's header
     header_bytes: [u8; HEADER_LENGTH],
+    bincode_options: bincode::DefaultOptions,
     _k: PhantomData<K>,
 }
 
@@ -487,7 +500,7 @@ where
                     Err(e) => return Some(Err(Error::Io(e))),
                 };
 
-                let key: K = match bincode::deserialize(&key) {
+                let key: K = match bincode::Options::deserialize(self.bincode_options, &key) {
                     Ok(k) => k,
                     Err(e) => return Some(Err(Error::Serde(e))),
                 };
@@ -541,9 +554,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, path::Path, thread::sleep};
-
     use crate::{Cask, Options};
+    use std::collections::HashSet;
+    use std::path::Path;
+    use std::thread::sleep;
 
     struct RmDir<P: AsRef<Path>>(P);
 

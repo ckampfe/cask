@@ -1,9 +1,10 @@
 //! TODO
-//! - merge
 //! - bincode config nonsense: is this fixed in bincode 2.0?
 //! - crc verify on initial entries load
 //! - figure out what to do with these "file already exists" timing errors
 //! - value compression via https://github.com/rust-lang/flate2-rs or something else?
+//! - use xxhash instead of crc32?
+//! - benchmarks?
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -110,11 +111,13 @@ pub enum SyncStrategy {
     #[default]
     EveryWrite,
     /// During sustained writes, data is synced to disk at most every `Duration`.
-    /// *Note that this only happens if `write` is called!*
-    /// There is no internal timer, so data can remain unsynced
-    /// if there is no `write` in a given interval!
+    ///
+    /// *WARNING*: with this strategy, syncing only happens if a
+    /// caller calls `write` within an interval!
+    /// `cask` has no runtime and as such there is no internal timer,
+    /// so data can remain unsynced if there is no `write` in a given interval!
     Interval(Duration),
-    /// Syncing only happens when the internal `BufWriter` is filled,
+    /// Syncing writes to disk happens at the discretion of the OS,
     /// or when `self.sync()` is explicitly called
     Manual,
 }
@@ -162,6 +165,17 @@ struct EntryRef {
     timestamp: TimestampMillis,
 }
 
+impl EntryRef {
+    fn entry_log_file(&self, data_directory: &str) -> std::io::Result<File> {
+        let file_id = self.file_id;
+        let mut path = PathBuf::new();
+        path.push(data_directory);
+        path.push(file_id.to_string());
+        path.set_extension("log");
+        std::fs::File::open(path)
+    }
+}
+
 impl<K, V> Cask<K, V>
 where
     K: Eq + Hash + serde::Serialize + serde::de::DeserializeOwned,
@@ -199,19 +213,14 @@ where
             //
             // open file
             //
-            let file_id = entry_ref.file_id;
-            let mut path = PathBuf::new();
-            path.push(&self.options.data_directory);
-            path.push(file_id.to_string());
-            path.set_extension("log");
-            let mut file = std::fs::File::open(path)?;
+            let mut log_file_for_entry = entry_ref.entry_log_file(&self.options.data_directory)?;
 
             //
             // read entry at position
             //
-            file.seek(SeekFrom::Start(entry_ref.entry_offset))?;
+            log_file_for_entry.seek(SeekFrom::Start(entry_ref.entry_offset))?;
             let mut buf = vec![0; entry_ref.entry_len as usize];
-            file.read_exact(&mut buf)?;
+            log_file_for_entry.read_exact(&mut buf)?;
 
             //
             // get header fields
@@ -282,14 +291,43 @@ where
     /// merge logfiles to their most compact representation
     /// invariant: user-visible database should be the same after merging as
     /// it was before merging
-    /// TODO should this return the number of scrubbed records?
     pub fn merge(&mut self) -> Result<()> {
+        //
+        // sync any pending writes to the existing current_log_file.
+        //
         self.sync()?;
-        todo!()
+
+        //
+        // find those files that we will delete
+        //
+        let log_files_to_delete: Vec<Result<(LogFileId, PathBuf)>> =
+            all_log_files(&self.options.data_directory)?.collect();
+
+        //
+        // create a new log file
+        //
+        self.rotate_log_file()?;
+
+        //
+        // copy the entries for all keys to the new log file,
+        // creating more log files if they spill over the size limit
+        //
+        self.copy_all_entries_to_current_log_file()?;
+
+        //
+        // remove the leftover log files
+        //
+        for log_file_result in log_files_to_delete {
+            let (_, log_file) = log_file_result?;
+            std::fs::remove_file(log_file)?;
+        }
+
+        Ok(())
     }
 
+    // the implementation of actually writing an entry to disk
     fn write(&mut self, key: K, value: ValueOrDeletion<V>) -> Result<()> {
-        self.maybe_rotate_log_file()?;
+        self.maybe_rotate_large_log_file()?;
 
         let key_bytes = bincode::Options::serialize(self.bincode_options, &key)
             .expect("could not serialize key");
@@ -355,22 +393,72 @@ where
         Ok(())
     }
 
-    /// create a new log file iff it is currently larger
+    /// create a new log file iff it is the same size or larger
     /// than the configured `max_file_len_target_bytes`
-    fn maybe_rotate_log_file(&mut self) -> Result<()> {
+    fn maybe_rotate_large_log_file(&mut self) -> Result<()> {
         if self.current_log_file_size_bytes >= self.options.max_file_len_target_bytes {
-            // force a sync to flush any pending writes to the current log file,
-            // as data in the internal write buffer could represent partial writes,
-            // and we do not want to stripe an entry across 2 different log files
-            self.sync()?;
-
-            let (new_log_file_id, new_log_file) = create_log_file(&self.options.data_directory)?;
-
-            self.current_log_file_id = new_log_file_id;
-            self.current_log_file = new_log_file;
-
-            self.current_log_file_size_bytes = 0;
+            self.rotate_log_file()?;
         }
+
+        Ok(())
+    }
+
+    fn rotate_log_file(&mut self) -> Result<()> {
+        // force a sync to flush any pending writes to the current log file,
+        // as data in the internal write buffer could represent partial writes,
+        // and we do not want to stripe an entry across 2 different log files
+        self.sync()?;
+
+        let (new_log_file_id, new_log_file) = create_log_file(&self.options.data_directory)?;
+
+        self.current_log_file_id = new_log_file_id;
+        self.current_log_file = new_log_file;
+
+        self.current_log_file_size_bytes = 0;
+        self.offset_bytes = 0;
+
+        Ok(())
+    }
+
+    fn copy_all_entries_to_current_log_file(&mut self) -> Result<()> {
+        // this is a hack
+        // so we can mutable iterate over entry_refs,
+        // while mutably borrowing self in the loop.
+        // if we don't move entry_refs out,
+        // we can't call `self.copy_raw_entry_to_current_log_file`
+        // in the loop
+        let mut entry_refs = std::mem::take(&mut self.entry_refs);
+
+        for (_k, entry_ref) in entry_refs.iter_mut() {
+            self.copy_raw_entry_to_current_log_file(entry_ref)?;
+        }
+
+        // and reset it here
+        self.entry_refs = entry_refs;
+
+        self.sync()?;
+
+        Ok(())
+    }
+
+    fn copy_raw_entry_to_current_log_file(&mut self, entry_ref: &mut EntryRef) -> Result<()> {
+        self.maybe_rotate_large_log_file()?;
+
+        let mut log_file_for_entry = entry_ref.entry_log_file(&self.options.data_directory)?;
+
+        log_file_for_entry.seek(SeekFrom::Start(entry_ref.entry_offset))?;
+
+        let mut take = log_file_for_entry.take(entry_ref.entry_len);
+
+        let copied_len = std::io::copy(&mut take, &mut self.current_log_file)?;
+
+        // lol
+        // TODO
+        // this should probably be a real error that we surface to the caller,
+        // notifying them that data is corrupt
+        assert_eq!(copied_len, entry_ref.entry_len);
+
+        entry_ref.file_id = self.current_log_file_id;
 
         Ok(())
     }
@@ -400,54 +488,80 @@ where
     }
 }
 
-fn load_entries<K>(data_directory: &str) -> Result<HashMap<K, EntryRef>>
+/// stream all log files and load their entries into EntryRefs
+fn load_entries<K>(data_directory: &str) -> Result<EntryRefs<K>>
 where
     K: Hash + Eq + serde::de::DeserializeOwned,
 {
     let mut entry_refs = EntryRefs::new();
 
-    for dir_entry in std::fs::read_dir(data_directory)? {
-        let dir_entry = dir_entry?;
+    for log_result in nonempty_log_files(data_directory)? {
+        let (log_file_id, log_file_path) = log_result?;
+        for offset_entry in stream_entry_refs(log_file_id, &log_file_path)? {
+            let (key, entry_ref) = offset_entry?;
 
-        if dir_entry.path().is_file()
-            && dir_entry.path().extension().is_some()
-            && dir_entry.path().extension().unwrap() == "log"
-        {
-            let current_log_file_id = dir_entry
-                .path()
-                .file_stem()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .parse::<LogFileId>()
-                .unwrap();
-
-            let mut current_log_file_path = PathBuf::new();
-            current_log_file_path.push(&data_directory);
-            current_log_file_path.push(current_log_file_id.to_string());
-            current_log_file_path.set_extension("log");
-
-            if current_log_file_path.metadata()?.len() > 0 {
-                for offset_entry in stream_entry_refs(current_log_file_id, &current_log_file_path)?
-                {
-                    let (key, entry_ref) = offset_entry?;
-
-                    // insert the entry_ref if its timestamp is later than
-                    // the existing timestamp, or insert it
-                    // if the key does not exist
-                    if let Some(e) = entry_refs.get_mut(&key) {
-                        if entry_ref.timestamp > e.timestamp {
-                            *e = entry_ref;
-                        }
-                    } else {
-                        entry_refs.insert(key, entry_ref);
-                    }
+            // insert the entry_ref if its timestamp is later than
+            // the existing timestamp, or insert it
+            // if the key does not exist
+            if let Some(e) = entry_refs.get_mut(&key) {
+                if entry_ref.timestamp > e.timestamp {
+                    *e = entry_ref;
                 }
+            } else {
+                entry_refs.insert(key, entry_ref);
             }
         }
     }
 
     Ok(entry_refs)
+}
+
+/// return an iterator of all log file (id, path)
+fn nonempty_log_files(
+    data_directory: &str,
+) -> Result<impl Iterator<Item = Result<(LogFileId, PathBuf)>> + '_> {
+    Ok(
+        all_log_files(data_directory)?.filter(|log_result| match log_result {
+            Ok((_, log_file_path)) => log_file_path
+                .metadata()
+                .map_or(true, |metadata| metadata.len() > 0),
+            Err(_e) => true,
+        }),
+    )
+}
+
+/// return an iterator of all log file (id, path)
+/// NOTE: includes empty log files (those files where .len() == 0)
+fn all_log_files(
+    data_directory: &str,
+) -> Result<impl Iterator<Item = Result<(LogFileId, PathBuf)>> + '_> {
+    Ok(std::fs::read_dir(data_directory)
+        .map_err(Error::Io)?
+        // only log files or errors,
+        // so we can propagate them
+        .filter(|dir_entry_result| match dir_entry_result {
+            Ok(dir_entry) => {
+                dir_entry.path().is_file()
+                    && dir_entry.path().extension().is_some()
+                    && dir_entry.path().extension().unwrap() == "log"
+            }
+            Err(_) => true,
+        })
+        .map(move |dir_entry| match dir_entry {
+            Ok(dir_entry) => {
+                let current_log_file_id = dir_entry
+                    .path()
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .parse::<LogFileId>()
+                    .expect("could not parse as LogFileId");
+
+                Ok((current_log_file_id, dir_entry.path()))
+            }
+            Err(e) => Err(e.into()),
+        }))
 }
 
 fn stream_entry_refs<K>(
@@ -774,5 +888,55 @@ mod tests {
 
         assert_ne!(current_log_file_id, new_log_file_id);
         assert!(new_log_file_id > current_log_file_id);
+    }
+
+    #[test]
+    fn merges_log_files() {
+        let options = Options {
+            data_directory: "test_data/merges".to_string(),
+            ..Default::default()
+        };
+
+        let _rm = RmDir(options.data_directory.clone());
+
+        for i in 0..5 {
+            let mut db: Cask<String, usize> = Cask::open(options.clone()).unwrap();
+            db.insert("a".to_string(), i).unwrap();
+            sleep(std::time::Duration::from_millis(15));
+        }
+
+        assert_eq!(
+            std::fs::read_dir(&options.data_directory)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .len(),
+            5
+        );
+
+        sleep(std::time::Duration::from_millis(15));
+
+        let mut db: Cask<String, usize> = Cask::open(options.clone()).unwrap();
+
+        assert_eq!(
+            std::fs::read_dir(&options.data_directory)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .len(),
+            6
+        );
+
+        assert_eq!(db.get(&"a".to_string()).unwrap().unwrap(), 4);
+
+        db.merge().unwrap();
+
+        assert_eq!(db.get(&"a".to_string()).unwrap().unwrap(), 4);
+
+        assert_eq!(
+            std::fs::read_dir(&options.data_directory)
+                .unwrap()
+                .collect::<Vec<_>>()
+                .len(),
+            1
+        );
     }
 }

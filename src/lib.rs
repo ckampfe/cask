@@ -2,7 +2,8 @@
 //! - bincode config nonsense: is this fixed in bincode 2.0?
 //! - crc verify on initial entries load
 //! - figure out what to do with these "file already exists" timing errors
-//! - value compression via https://github.com/rust-lang/flate2-rs or something else?
+//! - pluggable trait-based value compression (lz4, flate2, zstd)
+//! - property tests
 //! - use xxhash instead of crc32?
 //! - benchmarks?
 
@@ -101,6 +102,18 @@ impl Default for Options {
     }
 }
 
+/// `SyncStrategy` determines when to [fsync](https://linux.die.net/man/2/fsync)
+/// (or platform equivalent, via Rust's [File::sync_all])
+/// writes to disk. As writes are buffered internally for performance,
+/// the choice of `SyncStrategy` has important implications for both
+/// performance and safety. For example, if `write` is called but `sync`
+/// has not yet been called and the device loses power (or similar),
+/// it is possible for that write to not have been committed to disk.
+/// The default `SyncStrategy` is `EveryWrite`, which calls `sync`
+/// after every single write. This is the safest option, but it leaves
+/// quite a bit of throughput on the table, so it is possible to pick
+/// more relaxed strategies with higher write throughput if you are able
+/// to tolerate some data loss.
 #[derive(Clone, Debug, Default)]
 pub enum SyncStrategy {
     /// Data is synced to disk after every write.
@@ -468,6 +481,7 @@ impl<K: Serialize + DeserializeOwned, V: Serialize + DeserializeOwned> Cask<K, V
     /// Ensure that all pending insertions and deletes are persisted to disk.
     /// Calls fsync or its platform-specific equivalent.
     pub fn sync(&mut self) -> Result<()> {
+        // flush the internal BufWriter
         self.current_log_file.flush()?;
         // force the underlying File to fsync
         self.current_log_file.get_ref().sync_all()?;

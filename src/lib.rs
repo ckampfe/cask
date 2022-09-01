@@ -9,6 +9,7 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::hash::Hash;
@@ -221,7 +222,11 @@ where
     }
 
     /// read a key's value
-    pub fn get(&self, key: &K) -> Result<Option<V>> {
+    pub fn get<Q: ?Sized>(&self, key: &Q) -> Result<Option<V>>
+    where
+        K: Borrow<Q>,
+        Q: Hash + Eq,
+    {
         if let Some(entry_ref) = self.entry_refs.get(key) {
             //
             // open file

@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! TODO
 //! - bincode config nonsense: is this fixed in bincode 2.0?
 //! - crc verify on initial entries load

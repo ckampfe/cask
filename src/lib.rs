@@ -27,8 +27,8 @@ const DEFAULT_MAX_FILE_LEN_TARGET_BYTES: usize = 2usize.pow(28);
 
 const HEADER_LENGTH: usize = std::mem::size_of::<Crc>()
     + std::mem::size_of::<TimestampMillis>()
-    + std::mem::size_of::<KeyLen>()
-    + std::mem::size_of::<ValueLen>();
+    + std::mem::size_of::<BytesLen>() // key length
+    + std::mem::size_of::<BytesLen>(); // value length
 
 /// u32
 const CRC_BYTES_RANGE: Range<usize> = 0..4;
@@ -40,11 +40,16 @@ const KEY_LEN_BYTES_RANGE: Range<usize> = 20..28;
 const VALUE_LEN_BYTES_RANGE: Range<usize> = 28..HEADER_LENGTH;
 
 type EntryRefs<K> = HashMap<K, EntryRef>;
-type LogFileId = u128;
+
+#[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
+struct LogFileId(u128);
+
 type Crc = u32;
-type TimestampMillis = u128;
-type KeyLen = u64;
-type ValueLen = u64;
+
+#[derive(Debug, PartialEq, PartialOrd)]
+struct TimestampMillis(u128);
+
+struct BytesLen(u64);
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -57,10 +62,7 @@ pub enum Error {
     #[error(
         "CRC32 for data at offset `{entry_offset}` in file `{file_id}` did not match expected"
     )]
-    Corrupt {
-        file_id: LogFileId,
-        entry_offset: u64,
-    },
+    Corrupt { file_id: u128, entry_offset: u64 },
 }
 
 /// Distinguishes between a value and deletion on disk
@@ -186,7 +188,7 @@ impl EntryRef {
         let file_id = self.file_id;
         let mut path = PathBuf::new();
         path.push(data_directory);
-        path.push(file_id.to_string());
+        path.push(file_id.0.to_string());
         path.set_extension("log");
         std::fs::File::open(path)
     }
@@ -201,7 +203,7 @@ where
     pub fn open(options: Options) -> Result<Self> {
         std::fs::create_dir_all(&options.data_directory)?;
 
-        let entry_refs: HashMap<K, EntryRef> = load_entries(&options.data_directory)?;
+        let entry_refs = load_entries(&options.data_directory)?;
 
         let (current_log_file_id, current_log_file) = create_log_file(&options.data_directory)?;
 
@@ -253,11 +255,11 @@ where
             //
             // get kv
             //
-            let key_len = KeyLen::from_le_bytes(key_len_bytes.try_into().unwrap());
-            let value_len = ValueLen::from_le_bytes(value_len_bytes.try_into().unwrap());
-            let key_bytes = &buf[HEADER_LENGTH..(HEADER_LENGTH + key_len as usize)];
-            let value_bytes = &buf[(HEADER_LENGTH + key_len as usize)
-                ..(HEADER_LENGTH + key_len as usize + value_len as usize)];
+            let key_len = BytesLen(u64::from_le_bytes(key_len_bytes.try_into().unwrap()));
+            let value_len = BytesLen(u64::from_le_bytes(value_len_bytes.try_into().unwrap()));
+            let key_bytes = &buf[HEADER_LENGTH..(HEADER_LENGTH + key_len.0 as usize)];
+            let value_bytes = &buf[(HEADER_LENGTH + key_len.0 as usize)
+                ..(HEADER_LENGTH + key_len.0 as usize + value_len.0 as usize)];
 
             //
             // conditionally verify the read crc against the expected crc
@@ -275,7 +277,7 @@ where
 
                 if calculated_crc != expected_crc {
                     Err(Error::Corrupt {
-                        file_id: entry_ref.file_id,
+                        file_id: entry_ref.file_id.0,
                         entry_offset: entry_ref.entry_offset,
                     })?
                 }
@@ -347,35 +349,37 @@ where
 
     // the implementation of actually writing an entry to disk
     fn write(&mut self, key: K, value: ValueOrDeletion<V>) -> Result<()> {
-        self.maybe_rotate_large_log_file()?;
-
         let key_bytes = bincode::Options::serialize(self.bincode_options, &key)
             .expect("could not serialize key");
         let value_bytes = bincode::Options::serialize(self.bincode_options, &value)
             .expect("could not serialize value");
 
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_millis();
+        let timestamp = TimestampMillis(
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_millis(),
+        );
 
-        let key_len = key_bytes.len() as KeyLen;
-        let value_len = value_bytes.len() as ValueLen;
+        let key_len = BytesLen(key_bytes.len() as u64);
+        let value_len = BytesLen(value_bytes.len() as u64);
 
         let crc = {
             let mut crc = crc32fast::Hasher::new();
-            crc.update(&timestamp.to_le_bytes());
-            crc.update(&key_len.to_le_bytes());
-            crc.update(&value_len.to_le_bytes());
+            crc.update(&timestamp.0.to_le_bytes());
+            crc.update(&key_len.0.to_le_bytes());
+            crc.update(&value_len.0.to_le_bytes());
             crc.update(&key_bytes);
             crc.update(&value_bytes);
             crc.finalize()
         };
 
         self.current_log_file.write_all(&crc.to_le_bytes())?;
-        self.current_log_file.write_all(&timestamp.to_le_bytes())?;
-        self.current_log_file.write_all(&key_len.to_le_bytes())?;
-        self.current_log_file.write_all(&value_len.to_le_bytes())?;
+        self.current_log_file
+            .write_all(&timestamp.0.to_le_bytes())?;
+        self.current_log_file.write_all(&key_len.0.to_le_bytes())?;
+        self.current_log_file
+            .write_all(&value_len.0.to_le_bytes())?;
         self.current_log_file.write_all(&key_bytes)?;
         self.current_log_file.write_all(&value_bytes)?;
 
@@ -409,6 +413,8 @@ where
 
         self.offset_bytes += entry_len;
         self.current_log_file_size_bytes += entry_len as usize;
+
+        self.maybe_rotate_large_log_file()?;
 
         Ok(())
     }
@@ -449,7 +455,7 @@ where
         // in the loop
         let mut entry_refs = std::mem::take(&mut self.entry_refs);
 
-        for (_k, entry_ref) in entry_refs.iter_mut() {
+        for entry_ref in entry_refs.values_mut() {
             self.copy_raw_entry_to_current_log_file(entry_ref)?;
         }
 
@@ -570,14 +576,16 @@ fn all_log_files(
         })
         .map(move |dir_entry| match dir_entry {
             Ok(dir_entry) => {
-                let current_log_file_id = dir_entry
-                    .path()
-                    .file_stem()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .parse::<LogFileId>()
-                    .expect("could not parse as LogFileId");
+                let current_log_file_id: LogFileId = LogFileId(
+                    dir_entry
+                        .path()
+                        .file_stem()
+                        .unwrap()
+                        .to_str()
+                        .unwrap()
+                        .parse::<u128>()
+                        .expect("could not parse as LogFileId"),
+                );
 
                 Ok((current_log_file_id, dir_entry.path()))
             }
@@ -625,10 +633,10 @@ where
             Ok(_) => {
                 let key_len_bytes = &self.header_bytes[KEY_LEN_BYTES_RANGE];
                 let value_len_bytes = &self.header_bytes[VALUE_LEN_BYTES_RANGE];
-                let key_len = KeyLen::from_le_bytes(key_len_bytes.try_into().unwrap());
-                let value_len = ValueLen::from_le_bytes(value_len_bytes.try_into().unwrap());
+                let key_len = BytesLen(u64::from_le_bytes(key_len_bytes.try_into().unwrap()));
+                let value_len = BytesLen(u64::from_le_bytes(value_len_bytes.try_into().unwrap()));
 
-                let mut key = vec![0; key_len as usize];
+                let mut key = vec![0; key_len.0 as usize];
 
                 match self.log_file.read_exact(&mut key) {
                     Ok(_) => (),
@@ -640,7 +648,7 @@ where
                     Err(e) => return Some(Err(Error::Serde(e))),
                 };
 
-                let entry_len = HEADER_LENGTH as u64 + key_len + value_len;
+                let entry_len = HEADER_LENGTH as u64 + key_len.0 + value_len.0;
 
                 let item = Ok((
                     key,
@@ -648,9 +656,9 @@ where
                         file_id: self.log_file_id,
                         entry_len,
                         entry_offset: self.offset,
-                        timestamp: TimestampMillis::from_le_bytes(
+                        timestamp: TimestampMillis(u128::from_le_bytes(
                             self.header_bytes[TIMESTAMP_BYTES_RANGE].try_into().unwrap(),
-                        ),
+                        )),
                     },
                 ));
 
@@ -668,14 +676,16 @@ fn create_log_file<P>(data_directory: P) -> std::io::Result<(LogFileId, BufWrite
 where
     P: AsRef<Path>,
 {
-    let current_log_file_id = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("time went backwards")
-        .as_millis();
+    let current_log_file_id = LogFileId(
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_millis(),
+    );
 
     let mut current_log_file_path = PathBuf::new();
     current_log_file_path.push(&data_directory);
-    current_log_file_path.push(current_log_file_id.to_string());
+    current_log_file_path.push(current_log_file_id.0.to_string());
     current_log_file_path.set_extension("log");
 
     let current_log_file = OpenOptions::new()
@@ -886,29 +896,13 @@ mod tests {
         let initial_log_file_id = db.current_log_file_id;
 
         // 5 bytes + 6 bytes = 11 bytes,
-        // which is greater than 10 bytes
+        // which is greater than 10 bytes,
+        // and forces a rotation after the insertion
         db.insert("hello".to_string(), "there!".to_string())
             .unwrap();
 
-        let current_log_file_id = db.current_log_file_id;
-
-        // the initial log file id is the same as
-        // the log file id after this first write,
-        // as the write that is over
-        // the `max_file_len_target_bytes` causes
-        // the db to create a new file *only on the subsequent write*
-        assert_eq!(initial_log_file_id, current_log_file_id);
-
-        sleep(std::time::Duration::from_millis(5));
-
-        // this should force the new log file creation
-        db.insert("something else".to_string(), "here".to_string())
-            .unwrap();
-
-        let new_log_file_id = db.current_log_file_id;
-
-        assert_ne!(current_log_file_id, new_log_file_id);
-        assert!(new_log_file_id > current_log_file_id);
+        // the log file is rotated after the write
+        assert!(db.current_log_file_id > initial_log_file_id);
     }
 
     #[test]
